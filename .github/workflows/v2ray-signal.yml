@@ -1,0 +1,145 @@
+name: V2Ray WebRTC Tunnel
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'start یا stop'
+        required: true
+        type: choice
+        options:
+          - start
+          - stop
+        default: 'start'
+      local_port:
+        description: 'پورت روی کامپیوتر شما (برای V2Ray)'
+        required: true
+        default: '1080'
+
+jobs:
+  tunnel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: توقف همه اجراهای در حال کار
+        if: github.event.inputs.action == 'stop'
+        run: |
+          RUN_ID=${{ github.run_id }}
+          gh run list --workflow="${{ github.workflow }}" --branch="${{ github.ref_name }}" --status in_progress --json databaseId -q '.[].databaseId' | while read id; do
+            if [ "$id" != "$RUN_ID" ]; then
+              gh run cancel $id
+            fi
+          done
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: راه‌اندازی سرور و سیگنالینگ
+        if: github.event.inputs.action == 'start'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LOCAL_PORT: ${{ github.event.inputs.local_port }}
+        run: |
+          # 1. نصب Xray
+          sudo apt-get update && sudo apt-get install -y wget unzip
+          wget -O xray.zip https://github.com/XTLS/Xray-core/releases/download/v1.8.1/Xray-linux-64.zip
+          unzip xray.zip && chmod +x xray && sudo mv xray /usr/local/bin/xray
+
+          UUID=$(cat /proc/sys/kernel/random/uuid)
+          echo "UUID=$UUID"
+          cat << EOF | sudo tee /etc/xray_config.json
+          {
+            "inbounds": [{
+              "port": 443,
+              "protocol": "vless",
+              "settings": {
+                "clients": [{ "id": "$UUID" }],
+                "decryption": "none"
+              },
+              "streamSettings": {
+                "network": "xhttp",
+                "xhttpSettings": { "mode": "packet-up", "path": "/" }
+              }
+            }],
+            "outbounds": [{ "protocol": "freedom" }]
+          }
+          EOF
+          sudo /usr/local/bin/xray -c /etc/xray_config.json &
+
+          # 2. نصب Node.js و کتابخانه‌های WebRTC
+          curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+          sudo apt-get install -y nodejs
+          npm init -y
+          npm install node-datachannel wrtc socket.io-client 2>/dev/null || true
+          # در صورت نیاز از بسته‌های جایگزین استفاده می‌کنیم
+
+          # 3. ساخت Issue و تبادل SDP
+          ISSUE_TITLE="WebRTC Signal - $(date +%s)"
+          ISSUE_BODY="🔹 این issue برای تبادل سیگنال WebRTC ساخته شده. لطفاً پاسخ را همینجا کامنت کنید."
+          ISSUE_URL=$(gh issue create --title "$ISSUE_TITLE" --body "$ISSUE_BODY" --label "signal" --repo ${{ github.repository }} --json url -q '.url')
+          echo "Issue created: $ISSUE_URL"
+
+          # 4. اجرای اسکریپت WebRTC Offer
+          cat << 'OFFERSCRIPT' > offer.js
+          const fs = require('fs');
+          const { RTCPeerConnection, RTCSessionDescription } = require('wrtc');
+          const { execSync } = require('child_process');
+
+          const localPort = process.env.LOCAL_PORT || 1080;
+          const ghToken = process.env.GH_TOKEN;
+          const issueUrl = process.env.ISSUE_URL;
+
+          // تابع برای ارسال کامنت به issue
+          async function postComment(body) {
+            const repo = process.env.GITHUB_REPOSITORY;
+            const issueNumber = issueUrl.split('/').pop();
+            const cmd = `gh issue comment ${issueNumber} --body "${body}"`;
+            execSync(cmd, { env: { ...process.env, GH_TOKEN: ghToken } });
+          }
+
+          async function main() {
+            const pc = new RTCPeerConnection({
+              iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]   // ممکن است فیلتر باشد اما گاهی جواب می‌دهد
+            });
+
+            // طرف ریموت (شما) دیتا چنل می‌سازد، ما اینجا دریافت می‌کنیم
+            pc.ondatachannel = (event) => {
+              const channel = event.channel;
+              console.log('Data channel opened');
+              channel.onopen = () => console.log('Channel ready');
+              channel.onmessage = (e) => {
+                // هر پیامی که از شما برسد به Xray در پورت 443 فوروارد نمی‌شود؛
+                // در این روش ساده، ما مستقیماً تونل TCP نداریم.
+                // بهتر است از کتابخانه‌ای مثل node-datachannel برای تونل TCP استفاده کنیم.
+              };
+            };
+
+            const offer = await pc.createOffer();
+            await pc.setLocalDescription(offer);
+
+            // Post offer to issue
+            const offerBase64 = Buffer.from(JSON.stringify(pc.localDescription)).toString('base64');
+            await postComment(`OFFER:${offerBase64}`);
+
+            // Wait for answer (poll issue comments)
+            setInterval(async () => {
+              const comments = JSON.parse(execSync(`gh issue view ${issueNumber} --json comments -q '.comments[].body'`).toString());
+              for (const comment of comments) {
+                if (comment.startsWith('ANSWER:')) {
+                  const answerJson = Buffer.from(comment.substring(7), 'base64').toString();
+                  const answer = JSON.parse(answerJson);
+                  await pc.setRemoteDescription(new RTCSessionDescription(answer));
+                  console.log('Connected!');
+                  clearInterval(this);
+                  break;
+                }
+              }
+            }, 5000);
+
+            // جلوگیری از اتمام
+            setInterval(() => {}, 10000);
+          }
+          main();
+          OFFERSCRIPT
+
+          export ISSUE_URL=$ISSUE_URL
+          node offer.js
